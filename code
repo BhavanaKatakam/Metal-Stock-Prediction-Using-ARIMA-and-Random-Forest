@@ -1,0 +1,141 @@
+import numpy as np
+import pandas as pd
+import yfinance as yf
+from statsmodels.tsa.arima.model import ARIMA
+from pmdarima import auto_arima
+from sklearn.ensemble import RandomForestRegressor
+from sklearn.model_selection import GridSearchCV
+from sklearn.metrics import accuracy_score
+import matplotlib.pyplot as plt
+import logging
+from datetime import datetime
+
+# Configure logging
+logging.basicConfig(filename='forecast.log', level=logging.DEBUG)
+
+def add_features(df):
+    df['day_of_week'] = df.index.dayofweek
+    df['day_of_month'] = df.index.day
+    df['week_of_year'] = df.index.isocalendar().week
+    df['month'] = df.index.month
+    df['quarter'] = df.index.quarter
+    df['year'] = df.index.year
+
+    # Lag features
+    df['lag_1'] = df['Close'].shift(1)
+    df['lag_2'] = df['Close'].shift(2)
+    df['lag_3'] = df['Close'].shift(3)
+
+    # Rolling window statistics
+    df['rolling_mean_7'] = df['Close'].rolling(window=7).mean()
+    df['rolling_std_7'] = df['Close'].rolling(window=7).std()
+    df['rolling_mean_30'] = df['Close'].rolling(window=30).mean()
+    df['rolling_std_30'] = df['Close'].rolling(window=30).std()
+
+    # Drop NaN values
+    df = df.dropna()
+    return df
+
+def make_forecast(ticker_symbol, start_date_str, end_date_str, forecast_date_str):
+    forecast_result = ""
+    arima_predictions = []
+    rf_predictions = []
+    combined_predictions = []
+
+    try:
+        # Download historical data for the given ticker symbol
+        df = yf.download(ticker_symbol, start=start_date_str, end=end_date_str)
+        if df.empty:
+            raise ValueError("No data fetched. Please check the ticker symbol and date range.")
+
+        df = df.reset_index()
+        dates = df['Date']
+        df.set_index('Date', inplace=True)
+
+        # Apply preprocessing steps
+        df['Close_diff'] = df['Close'].diff()  # Differencing
+        df['Close_log'] = np.log(df['Close'])  # Logarithmic transformation
+        df['Close_seasonal_diff'] = df['Close'].diff(12)  # Seasonal differencing (assuming a seasonal period of 12 months)
+
+        # Add features
+        df = add_features(df)
+
+        # Split the data into training and testing sets
+        train_size = int(len(df) * 0.80)
+        train_data, test_data = df[:train_size], df[train_size:]
+
+        if train_data.Close.empty or train_data.Close.isnull().any():
+            forecast_result = "Error: No valid training data. Please choose a different date range."
+        else:
+            # Random Forest Model
+            rf_model = RandomForestRegressor(random_state=42)
+            param_grid = {
+              'n_estimators': [100, 200, 300],  # Number of trees in the forest
+              'max_depth': [5, 10, 15]        # Maximum depth of individual trees
+            }
+            grid_search = GridSearchCV(rf_model, param_grid, cv=5, scoring='neg_mean_squared_error')
+            grid_search.fit(train_data.drop(['Close'], axis=1), train_data['Close'])
+            rf_model = grid_search.best_estimator_  # Use the best model from GridSearchCV
+
+            rf_predictions = rf_model.predict(df.drop(['Close'], axis=1))
+
+            # Optimize ARIMA Model using auto_arima
+            arima_model = auto_arima(train_data['Close'], seasonal=False, trace=True, error_action='ignore', suppress_warnings=True)
+            arima_order = arima_model.order
+            arima_model_fit = ARIMA(train_data['Close'], order=arima_order).fit()
+
+            forecast_date = pd.to_datetime(forecast_date_str)
+            arima_forecast = arima_model_fit.forecast(steps=30)  # Predicting for 30 days
+
+            min_length = min(len(rf_predictions), len(arima_forecast))
+            combined_predictions = (rf_predictions[:min_length] + arima_forecast[:min_length]) / 2
+
+            # Generate predictions for display
+            forecast_dates = pd.date_range(start=forecast_date, periods=len(combined_predictions), freq='D')
+            arima_predictions = list(zip(forecast_dates, arima_forecast))
+            rf_predictions = list(zip(dates[:len(rf_predictions)], rf_predictions))
+            combined_predictions = list(zip(forecast_dates, combined_predictions))
+
+            # Calculate accuracy metrics
+            if not test_data.Close.empty:
+                test_forecast_rf = rf_model.predict(test_data.drop(['Close'], axis=1))
+                test_forecast_arima = arima_model_fit.forecast(steps=len(test_data))
+                test_forecast_combined = (test_forecast_rf[:len(test_data)] + test_forecast_arima[:len(test_data)]) / 2
+
+                # Binary classification accuracy
+                true_signals = np.sign(test_data.Close.diff().dropna())
+                true_signals = np.where(true_signals == -1, 0, true_signals)
+                combined_signals = np.sign(np.diff(test_forecast_combined))
+                combined_signals = np.where(combined_signals == -1, 0, combined_signals)
+                combined_accuracy = accuracy_score(true_signals, combined_signals) * 100
+
+                classification_accuracy = (f"\nAccuracy:\n"
+                                           f"Combined - Accuracy: {combined_accuracy:.2f}%")
+                forecast_result += classification_accuracy
+
+            # Plotting the actual vs predicted values
+            plt.figure(figsize=(10, 5))
+            plt.plot(dates[:len(df.Close)], df.Close, label='Actual Prices')
+            plt.plot(dates[:len(rf_predictions)], [pred[1] for pred in rf_predictions], label='Random Forest Predictions')
+            plt.plot(dates[:len(arima_model_fit.predict(start=0, end=len(df)-1))], arima_model_fit.predict(start=0, end=len(df)-1), label='ARIMA Predictions')
+            plt.plot(forecast_dates, [pred[1] for pred in combined_predictions], label='Combined Predictions', linestyle='--')
+            plt.xlabel('Date')
+            plt.ylabel('Price')
+            plt.title(f'Actual and Predicted Prices for {ticker_symbol}')
+            plt.legend()
+            plt.grid(True)
+            plt.show()
+
+    except Exception as e:
+        error_message = str(e)  # Get the error message
+        logging.exception("An error occurred during forecast calculation: %s", error_message)
+        forecast_result = f"An error occurred during forecast calculation: {error_message}. Please try again later."
+
+    # Log the forecast result
+    logging.info("Forecast result: %s", forecast_result)
+
+    return forecast_result, arima_predictions, rf_predictions, combined_predictions
+
+# Example usage:
+result, arima_preds, rf_preds, combined_preds = make_forecast('STLD', '2022-05-24','2024-05-24','2024-05-25')
+print(result)
